@@ -41,6 +41,7 @@ typedef struct
   uint8_t ep_out;
 
   /*------------- From this point, data is not cleared by bus reset -------------*/
+  char wanted_char;
   tu_fifo_t rx_ff;
   tu_fifo_t tx_ff;
 
@@ -59,12 +60,17 @@ typedef struct
 
 CFG_TUSB_MEM_SECTION static vendord_interface_t _vendord_itf[CFG_TUD_VENDOR];
 
-#define ITF_MEM_RESET_SIZE   offsetof(vendord_interface_t, rx_ff)
+#define ITF_MEM_RESET_SIZE   offsetof(vendord_interface_t, wanted_char)
 
 
 bool tud_vendor_n_mounted (uint8_t itf)
 {
   return _vendord_itf[itf].ep_in && _vendord_itf[itf].ep_out;
+}
+
+void tud_vendor_n_set_wanted_char (uint8_t itf, char wanted)
+{
+  _vendord_itf[itf].wanted_char = wanted;
 }
 
 uint32_t tud_vendor_n_available (uint8_t itf)
@@ -101,6 +107,13 @@ uint32_t tud_vendor_n_read (uint8_t itf, void* buffer, uint32_t bufsize)
   return num_read;
 }
 
+void tud_vendor_n_read_flush (uint8_t itf)
+{
+  vendord_interface_t* p_itf = &_vendord_itf[itf];
+  tu_fifo_clear(&p_itf->rx_ff);
+  _prep_out_transaction(p_itf);
+}
+
 //--------------------------------------------------------------------+
 // Write API
 //--------------------------------------------------------------------+
@@ -109,12 +122,27 @@ static bool maybe_transmit(vendord_interface_t* p_itf)
   // skip if previous transfer not complete
   TU_VERIFY( !usbd_edpt_busy(TUD_OPT_RHPORT, p_itf->ep_in) );
 
+  TU_VERIFY( usbd_edpt_claim(TUD_OPT_RHPORT, p_itf->ep_in), 0 );
+
   uint16_t count = tu_fifo_read_n(&p_itf->tx_ff, p_itf->epin_buf, CFG_TUD_VENDOR_EPSIZE);
   if (count > 0)
   {
     TU_ASSERT( usbd_edpt_xfer(TUD_OPT_RHPORT, p_itf->ep_in, p_itf->epin_buf, count) );
   }
+  else
+  {
+    usbd_edpt_release(TUD_OPT_RHPORT, p_itf->ep_in);
+  }
   return true;
+}
+
+void tud_vendor_write_flush(void)
+{
+  for (uint8_t i=0; i<CFG_TUD_VENDOR; i++)
+  {
+    vendord_interface_t* p_itf = &_vendord_itf[i];
+    maybe_transmit(p_itf);
+  }
 }
 
 uint32_t tud_vendor_n_write (uint8_t itf, void const* buffer, uint32_t bufsize)
@@ -140,6 +168,8 @@ void vendord_init(void)
   for(uint8_t i=0; i<CFG_TUD_VENDOR; i++)
   {
     vendord_interface_t* p_itf = &_vendord_itf[i];
+
+    p_itf->wanted_char = -1;
 
     // config fifo
     tu_fifo_config(&p_itf->rx_ff, p_itf->rx_ff_buf, CFG_TUD_VENDOR_RX_BUFSIZE, 1, false);
@@ -217,20 +247,43 @@ bool vendord_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint
 
   if ( ep_addr == p_itf->ep_out )
   {
-    // Receive new data
-    tu_fifo_write_n(&p_itf->rx_ff, p_itf->epout_buf, xferred_bytes);
+    // added CTRL-C support to match the CDC interface
+    // TODO search for wanted char first for better performance
+    for(uint32_t i=0; i<xferred_bytes; i++)
+    {
+      tu_fifo_write(&p_itf->rx_ff, &p_itf->epout_buf[i]);
 
-    // Invoked callback if any
-    if (tud_vendor_rx_cb) tud_vendor_rx_cb(itf);
+      // Check for wanted char and invoke callback if needed
+      if ( tud_vendor_rx_wanted_cb && ( ((signed char) p_itf->wanted_char) != -1 ) && ( p_itf->wanted_char == p_itf->epout_buf[i] ) )
+      {
+        tud_vendor_rx_wanted_cb(itf, p_itf->wanted_char);
+      }
+    }
+
+    // invoke receive callback (if there is still data)
+    if (tud_vendor_rx_cb && tu_fifo_count(&p_itf->rx_ff) ) tud_vendor_rx_cb(itf);
 
     _prep_out_transaction(p_itf);
   }
   else if ( ep_addr == p_itf->ep_in )
   {
-    // Send complete, try to send more if possible
-    maybe_transmit(p_itf);
+    // You can find similar code over in vendor_cdc.c, for the same reason
+    // If there is data to be sent, send it...
+    if (tu_fifo_count(&_vendord_itf[itf].tx_ff) > 0)
+    {
+      maybe_transmit(p_itf);
+    }
+    // ...otherwise check for a special case where a full-length previous packet
+    // causes the other end to think more data is coming (and causes it to WAIT for that data)
+    else if (xferred_bytes && (0 == (xferred_bytes & (CFG_TUD_VENDOR_EPSIZE-1))))
+    {
+      // Try to send a Zero Length Packet (ZLP) to unstall the other end
+      if (usbd_edpt_claim(rhport, p_itf->ep_in))
+      {
+        usbd_edpt_xfer(rhport, p_itf->ep_in, NULL, 0);
+      }
+    }
   }
-
   return true;
 }
 
